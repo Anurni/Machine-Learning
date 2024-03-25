@@ -1,0 +1,181 @@
+# imports
+from nltk.corpus import brown
+from nltk.util import trigrams as tg
+from nltk.tokenize import word_tokenize
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from sklearn.preprocessing import LabelEncoder
+import numpy as np
+import gensim
+import os
+
+#   getting the data and pre-trained word embeddings
+pos_tagged_words = brown.tagged_words(categories='news', tagset='universal')
+POS_TAG_INDICES = {'DET': 0, 'NOUN': 1, 'ADJ': 2, 'VERB': 3, 'ADP': 4, '.': 5, 'ADV': 6, 'CONJ': 7, 'PRT': 8, 'PRON': 9, 'NUM': 10, 'X': 11}
+embeddings_file = 'GoogleNews-pruned2tweets.bin'
+embeddings_path = os.path.join(os.path.dirname(__file__), embeddings_file)
+gensim_embeds = gensim.models.KeyedVectors.load_word2vec_format(os.path.join(embeddings_path), binary=True)
+pretrained_embeds = gensim_embeds.vectors
+
+ # To convert words in the input tweet to indices of the embeddings matrix:
+word_to_idx = {}
+for i, word in enumerate(gensim_embeds.index_to_key):    #  index_to_key is all the words in the vocabulary
+    word_to_idx[word] = i
+
+#  dealing with our data, saving words and tags into separate lists
+vocabulary = []
+all_pos_tags = []
+unique_pos_tags = []
+
+for word in pos_tagged_words:
+    vocabulary.append(word[0])
+    all_pos_tags.append(word[1])
+    if word[1] not in unique_pos_tags:
+        unique_pos_tags.append(word[1])
+
+# word into an embedding, using pre-trained embeddings
+def word_into_index_and_embedding(word):
+    """
+    Args: a token (word)
+
+    Creates a list of token indices retrieved from 'word_to_idx'.
+    Then, retrieves the pretrained embedding for the word from 'pretrained embeds' with the help of the indice.
+    Creates a tensor of this token embedding.
+
+    Returns: a 1x300 tensor, representing a word.
+
+    """
+    try:
+        tokenidx = word_to_idx[word]
+        word_embedding = torch.tensor(pretrained_embeds[tokenidx])
+        return word_embedding
+    except KeyError:    # <---- this needs to be fixed, why are there so many words that are not found in the word_to_idx?
+        return torch.zeros(300)
+
+#   string label to pytorch tensor:
+def label_to_idx(label):
+    return torch.LongTensor([POS_TAG_INDICES[label]])
+
+# pytorch tensor back to a string:
+def idx_to_label(labeltensor):
+    for tag, index in POS_TAG_INDICES.items():
+        if index == labeltensor:
+            return tag
+    
+#  splitting data for training, dev, and test 
+training_data_x = vocabulary[:80443]                # 80 % slice of 100554
+training_data_y = all_pos_tags[:80443]              # 80 % slice of 100554
+development_data_x = vocabulary[80443:90498]        # 10% slice of 100554 
+development_data_y = all_pos_tags[80443:90498]      # 10% slice of 100554
+testing_data_x = vocabulary[90498:]                 # 10% slice of 100554
+testing_data_y = all_pos_tags[90498:]               # 10% slice of 100554
+
+
+# hyperparameters:
+epochs = 10
+input_dim = 300
+hidden_dim1 = 200
+hidden_dim2 = 100
+output_dim = 12 #number of unique POS-tags we have
+
+learning_rate = 0.005
+report_every = 1
+verbose = True
+
+
+# defining our model, a simple feed-forward neural network
+
+class FFNN_POS_Tagger(nn.Module):
+    def __init__(self, input_dim, hidden_dim1, hidden_dim2, output_dim):
+        """Args: 
+        input_dim (int): size of the input vector(s)
+        hidden_him(int): size of the first LLayer
+        output_dim(int): size of the second Llayer
+        """
+        super(FFNN_POS_Tagger, self).__init__()
+        self.fc1 = nn.Linear(input_dim, hidden_dim1)    # Input layer (fully connected)
+        self.fc2 = nn.Linear(hidden_dim1, hidden_dim2)   # Output layer (fully connected)
+        self.fc3 = nn.Linear(hidden_dim2, output_dim)
+
+        # initializing our activation function (relu) and softmax
+        self.activationfunction = F.relu
+        self.softmax = F.log_softmax
+
+    def forward(self, x):
+        """Args:
+        x: a input data tensor - shape should be (batch, input_dim)
+           Returns: 
+           the resulting tensor - shape should be (batch, output_dim)
+        """
+        #print(x) 
+        x = word_into_index_and_embedding(x)
+        x = self.fc1(x)
+        x = self.activationfunction(x)  # Applying ReLU activation function
+        x = self.fc2(x)
+        x = self.activationfunction(x)  # Applying ReLU activation function
+        x = self.fc3(x)                          
+        output = self.softmax(x, dim=0)
+        return output  
+
+
+# # Model instantiation
+
+model = FFNN_POS_Tagger(input_dim, hidden_dim1, hidden_dim2, output_dim) #initializing the model
+loss_function = torch.nn.NLLLoss()   
+optimizer = optim.SGD(model.parameters(), lr=learning_rate)
+
+# training 
+for epoch in range(epochs):
+    training_data = zip(training_data_x,training_data_y)
+    total_loss = 0
+    for word,tag in training_data:
+            gold_class = label_to_idx(tag)
+            optimizer.zero_grad()
+            y_pred = model(word)   
+            #print("this is the y_pred", y_pred)
+            loss = loss_function(y_pred.unsqueeze(0), gold_class)
+            total_loss = total_loss + loss.item()
+            loss.backward()
+            optimizer.step()
+
+    if ((epoch + 1) % report_every) == 0:
+        print(f"epoch: {epoch}, loss: {round(total_loss * 100 / len(training_data_x), 4)}")
+
+# testing
+correct_dev = 0
+development_data = zip(development_data_x, development_data_y)
+with torch.no_grad():
+    for word,tag in development_data:
+        gold_class_dev = label_to_idx(tag)
+        y_pred_dev = np.argmax(model(word))
+        correct_dev += torch.eq(y_pred_dev, gold_class_dev).item()
+    #if verbose:
+        #print('DEV DATA: %s, OUTPUT: %s, GOLD LABEL: %d' % (tweet['BODY'], tweet['SENTIMENT'], y_pred_dev))
+
+print(f"dev accuracy: {round(100 * correct_dev / len(development_data_x), 2)}")
+
+# test with test set 
+correct_test = 0
+test_predictions = []
+test_data = zip(testing_data_x, testing_data_y)
+with torch.no_grad():
+    for word,tag in test_data:
+        y_pred_test = np.argmax(model(word))
+        test_predictions.append(idx_to_label(y_pred_test))   #transforming the label back to a string now
+
+        gold_class_test = label_to_idx(tag)
+
+        correct_test += torch.eq(y_pred_test, gold_class_test).item()
+
+    if verbose:
+        #print('TEST DATA: %s, OUTPUT: %s, GOLD LABEL: %d' % (tweet['BODY'], tweet['SENTIMENT'], y_pred_test))
+        print(f"test accuracy: {round(100 * correct_test / len(testing_data_x), 2)}")
+
+
+
+
+
+
+
