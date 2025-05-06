@@ -1,1 +1,1 @@
-Here are some of my machine learning programs! 
+Några av mina kursuppgifter: Maskininlärning för statistisk datalingvistik: inledning
